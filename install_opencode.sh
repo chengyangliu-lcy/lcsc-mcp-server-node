@@ -12,10 +12,18 @@ if ! command -v node &> /dev/null; then
     exit 1
 fi
 
-# 全局安装
+# 安装依赖、构建并全局安装
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR" || exit 1
+
+echo "正在安装依赖..."
+npm install || exit 1
+
+echo "正在构建 lcsc-mcp-server..."
+npm run build || exit 1
+
 echo "正在全局安装 lcsc-mcp-server..."
-cd "$SCRIPT_DIR" && npm install -g .
+npm install -g . || exit 1
 
 # 写入 OpenCode 配置
 mkdir -p "$CONFIG_DIR"
