@@ -6,63 +6,165 @@ import { z } from "zod";
 
 // ── Rate limiter ────────────────────────────────────────────────────────────
 
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 let lastRequestTime = 0;
-let cooldownUntil = 0; // 全局冷却期：任一次 403 后，所有请求等待到此时间
-const MIN_INTERVAL_MS = 3000;     // 正常请求间隔 3s
-const MAX_RETRIES = 2;            // 最多重试 2 次
-const BACKOFF_BASE_MS = 10000;    // 首次退避 10s
-const COOLDOWN_AFTER_403_MS = 30000; // 命中 403 后的全局冷却 30s
+let cooldownUntil = 0; // 全局冷却期：任一次 403/429 后，所有请求等待到此时间
+const MIN_INTERVAL_MS = readPositiveIntEnv("LCSC_MCP_MIN_INTERVAL_MS", 3000);
+const MAX_RETRIES = readPositiveIntEnv("LCSC_MCP_MAX_RETRIES", 2);
+const BACKOFF_BASE_MS = readPositiveIntEnv("LCSC_MCP_BACKOFF_BASE_MS", 10000);
+const COOLDOWN_AFTER_403_MS = readPositiveIntEnv(
+  "LCSC_MCP_COOLDOWN_AFTER_403_MS",
+  30000
+);
+const REQUEST_TIMEOUT_MS = readPositiveIntEnv(
+  "LCSC_MCP_REQUEST_TIMEOUT_MS",
+  15000
+);
 
 async function rateLimitedFetch(
   url: string,
   init?: RequestInit
 ): Promise<Response> {
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const now = Date.now();
+    await waitForGlobalCooldown();
+    await waitForRequestInterval();
 
-    // 全局冷却
-    if (cooldownUntil > now) {
-      const wait = cooldownUntil - now;
-      console.error(`[lcsc-mcp] 全局冷却中，等待 ${(wait / 1000).toFixed(1)}s...`);
-      await sleep(wait);
-    }
-
-    // 请求间隔
-    const sinceLast = Date.now() - lastRequestTime;
-    if (sinceLast < MIN_INTERVAL_MS) {
-      await sleep(MIN_INTERVAL_MS - sinceLast);
-    }
-    lastRequestTime = Date.now();
-
-    const resp = await fetch(url, init);
-
-    if (resp.status === 403) {
-      cooldownUntil = Date.now() + COOLDOWN_AFTER_403_MS;
-      if (attempt < MAX_RETRIES) {
+    let resp: Response;
+    try {
+      resp = await fetchWithTimeout(url, init, REQUEST_TIMEOUT_MS);
+    } catch (e) {
+      if (attempt < MAX_RETRIES && isRetryableNetworkError(e)) {
         const backoff = BACKOFF_BASE_MS * 2 ** attempt;
         console.error(
-          `[lcsc-mcp] 403 (attempt ${attempt + 1}/${MAX_RETRIES + 1}), 退避 ${backoff / 1000}s, 全局冷却 ${COOLDOWN_AFTER_403_MS / 1000}s`
+          `[lcsc-mcp] network error (attempt ${attempt + 1}/${
+            MAX_RETRIES + 1
+          }), 退避 ${(backoff / 1000).toFixed(1)}s: ${getErrorMessage(e)}`
         );
         await sleep(backoff);
         continue;
       }
-      throw new RateLimitError(COOLDOWN_AFTER_403_MS);
+      throw e;
     }
 
-    if (resp.status === 429) {
-      cooldownUntil = Date.now() + COOLDOWN_AFTER_403_MS;
-      const retryAfter =
-        parseInt(resp.headers.get("Retry-After") || "30", 10) * 1000;
-      throw new RateLimitError(Math.max(retryAfter, COOLDOWN_AFTER_403_MS));
+    if (resp.status === 403 || resp.status === 429) {
+      const retryAfter = parseRetryAfterMs(resp.headers.get("Retry-After"));
+      const cooldown = Math.max(
+        retryAfter ?? 0,
+        resp.status === 403 ? COOLDOWN_AFTER_403_MS : 0
+      );
+      cooldownUntil = Date.now() + cooldown;
+
+      if (attempt < MAX_RETRIES) {
+        const backoff = Math.max(BACKOFF_BASE_MS * 2 ** attempt, cooldown);
+        console.error(
+          `[lcsc-mcp] ${resp.status} (attempt ${attempt + 1}/${
+            MAX_RETRIES + 1
+          }), 退避 ${(backoff / 1000).toFixed(1)}s`
+        );
+        await sleep(backoff);
+        continue;
+      }
+
+      throw new RateLimitError(cooldown || COOLDOWN_AFTER_403_MS);
+    }
+
+    if (resp.status >= 500 && attempt < MAX_RETRIES) {
+      const backoff = BACKOFF_BASE_MS * 2 ** attempt;
+      console.error(
+        `[lcsc-mcp] HTTP ${resp.status} (attempt ${attempt + 1}/${
+          MAX_RETRIES + 1
+        }), 退避 ${(backoff / 1000).toFixed(1)}s`
+      );
+      await sleep(backoff);
+      continue;
     }
 
     if (!resp.ok) {
-      throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
+      throw new HttpError(resp.status, resp.statusText);
     }
 
     return resp;
   }
   throw new RateLimitError(COOLDOWN_AFTER_403_MS);
+}
+
+async function waitForGlobalCooldown(): Promise<void> {
+  const now = Date.now();
+  if (cooldownUntil <= now) return;
+
+  const wait = cooldownUntil - now;
+  console.error(`[lcsc-mcp] 全局冷却中，等待 ${(wait / 1000).toFixed(1)}s...`);
+  await sleep(wait);
+}
+
+async function waitForRequestInterval(): Promise<void> {
+  const sinceLast = Date.now() - lastRequestTime;
+  if (sinceLast < MIN_INTERVAL_MS) {
+    await sleep(MIN_INTERVAL_MS - sinceLast);
+  }
+  lastRequestTime = Date.now();
+}
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit | undefined,
+  timeoutMs: number
+): Promise<Response> {
+  const controller = new AbortController();
+  const upstreamSignal = init?.signal;
+  const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+
+  if (upstreamSignal?.aborted) {
+    controller.abort(upstreamSignal.reason);
+  } else {
+    upstreamSignal?.addEventListener("abort", abortFromUpstream, {
+      once: true,
+    });
+  }
+
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (e) {
+    if (controller.signal.aborted && !upstreamSignal?.aborted) {
+      throw new RequestTimeoutError(timeoutMs);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    upstreamSignal?.removeEventListener("abort", abortFromUpstream);
+  }
+}
+
+function parseRetryAfterMs(value: string | null): number | null {
+  if (!value) return null;
+
+  const seconds = Number.parseInt(value, 10);
+  if (Number.isFinite(seconds)) {
+    return Math.max(seconds, 0) * 1000;
+  }
+
+  const dateMs = Date.parse(value);
+  if (Number.isFinite(dateMs)) {
+    return Math.max(dateMs - Date.now(), 0);
+  }
+
+  return null;
+}
+
+function isRetryableNetworkError(e: unknown): boolean {
+  return e instanceof RequestTimeoutError || e instanceof TypeError;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -74,6 +176,24 @@ class RateLimitError extends Error {
   constructor(retryAfterMs: number) {
     super(`Rate limited, retry after ${retryAfterMs}ms`);
     this.retryAfterMs = retryAfterMs;
+  }
+}
+
+class RequestTimeoutError extends Error {
+  timeoutMs: number;
+  constructor(timeoutMs: number) {
+    super(`Request timed out after ${timeoutMs}ms`);
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+class HttpError extends Error {
+  status: number;
+  statusText: string;
+  constructor(status: number, statusText: string) {
+    super(`HTTP ${status}: ${statusText}`);
+    this.status = status;
+    this.statusText = statusText;
   }
 }
 
@@ -94,19 +214,37 @@ const HEADERS: Record<string, string> = {
 
 const cache = new Map<string, { ts: number; data: unknown }>();
 const CACHE_TTL_MS = 3600_000;
+const CACHE_MAX_ENTRIES = readPositiveIntEnv("LCSC_MCP_CACHE_MAX_ENTRIES", 500);
 
 function getCached<T>(key: string): T | null {
   const entry = cache.get(key);
   if (!entry) return null;
+
   if (Date.now() - entry.ts > CACHE_TTL_MS) {
     cache.delete(key);
     return null;
   }
+
+  // 简单 LRU：命中后移动到 Map 末尾，便于淘汰最旧条目。
+  cache.delete(key);
+  cache.set(key, entry);
   return entry.data as T;
 }
 
 function setCache(key: string, data: unknown) {
+  if (!cache.has(key) && cache.size >= CACHE_MAX_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    if (oldestKey) cache.delete(oldestKey);
+  }
   cache.set(key, { ts: Date.now(), data });
+}
+
+async function parseJsonResponse<T>(resp: Response): Promise<T> {
+  try {
+    return (await resp.json()) as T;
+  } catch {
+    throw new Error("嘉立创 API 返回的不是合法 JSON，可能触发了风控页或接口结构已变化。");
+  }
 }
 
 // ── Search ──────────────────────────────────────────────────────────────────
@@ -179,7 +317,8 @@ async function searchComponents(
   page: number,
   pageSize: number
 ): Promise<{ total: number; products: NormalizedProduct[] }> {
-  const cacheKey = `search:${keyword}:${page}:${pageSize}`;
+  const normalizedKeyword = keyword.trim();
+  const cacheKey = `search:${normalizedKeyword.toLowerCase()}:${page}:${pageSize}`;
   const cached = getCached<{ total: number; products: NormalizedProduct[] }>(
     cacheKey
   );
@@ -193,14 +332,18 @@ async function searchComponents(
       Referer: "https://jlcpcb.com/parts",
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({ keyword, pageSize, currentPage: page }),
+    body: JSON.stringify({
+      keyword: normalizedKeyword,
+      pageSize,
+      currentPage: page,
+    }),
   });
 
-  const raw = (await resp.json()) as {
+  const raw = await parseJsonResponse<{
     data?: {
       componentPageInfo?: { total?: number; list?: JlcpcbProduct[] };
     };
-  };
+  }>(resp);
 
   const pageInfo = raw.data?.componentPageInfo;
   const products = (pageInfo?.list ?? []).map(normalizeJlcpcbProduct);
@@ -269,7 +412,7 @@ async function getProductDetail(
   url.searchParams.set("productCode", productCode);
 
   const resp = await rateLimitedFetch(url.toString(), { headers: HEADERS });
-  const raw = (await resp.json()) as { result?: LcscDetail };
+  const raw = await parseJsonResponse<{ result?: LcscDetail }>(resp);
   const r = raw.result;
   if (!r) return null;
 
@@ -338,13 +481,58 @@ function formatDetail(d: NormalizedDetail): string {
   return lines.join("\n");
 }
 
-// ── Rate limit error message ────────────────────────────────────────────────
+// ── Input normalization and tool errors ─────────────────────────────────────
 
-function rateLimitMsg(e: unknown): string {
-  if (e instanceof RateLimitError) {
-    return `嘉立创 API 请求过于频繁，已被限流。请等待 ${Math.ceil(e.retryAfterMs / 1000)} 秒后重试。`;
+const PRODUCT_CODE_PATTERN = /^C?\d+$/i;
+
+function normalizeProductCode(productCode: string): string {
+  const code = productCode.trim().toUpperCase();
+  if (!PRODUCT_CODE_PATTERN.test(code)) {
+    throw new Error('LCSC C编号格式不正确，请输入类似 "C123456" 或 "123456" 的编号。');
   }
-  throw e;
+  return code.startsWith("C") ? code : `C${code}`;
+}
+
+function getErrorMessage(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  return String(e);
+}
+
+function toToolError(prefix: string, e: unknown) {
+  if (e instanceof RateLimitError) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `嘉立创 API 请求过于频繁，已被限流。请等待 ${Math.ceil(
+            e.retryAfterMs / 1000
+          )} 秒后重试。`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  if (e instanceof RequestTimeoutError) {
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `嘉立创 API 请求超时，请稍后重试。当前超时时间为 ${Math.ceil(
+            e.timeoutMs / 1000
+          )} 秒。`,
+        },
+      ],
+      isError: true,
+    };
+  }
+
+  return {
+    content: [
+      { type: "text" as const, text: `${prefix}: ${getErrorMessage(e)}` },
+    ],
+    isError: true,
+  };
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
@@ -358,7 +546,12 @@ server.tool(
   "lcsc_search",
   "搜索 LCSC 嘉立创元器件库。输入关键词，返回匹配的元器件列表，包含 C编号、名称、型号、厂商、分类、库存、阶梯价格、Basic(免费贴片)/Extended(额外收费)标识、数据手册链接。适用于所有元器件搜索场景。",
   {
-    keyword: z.string().describe('搜索关键词，如 "STM32F103"、"100nF 0402"'),
+    keyword: z
+      .string()
+      .trim()
+      .min(1, "搜索关键词不能为空")
+      .max(100, "搜索关键词过长，请控制在 100 个字符以内")
+      .describe('搜索关键词，如 "STM32F103"、"100nF 0402"'),
     page: z.number().int().min(1).default(1).describe("页码，从1开始"),
     page_size: z
       .number()
@@ -373,14 +566,7 @@ server.tool(
       const data = await searchComponents(keyword, page, page_size);
       return { content: [{ type: "text", text: formatSearchResults(data) }] };
     } catch (e) {
-      try {
-        return { content: [{ type: "text", text: rateLimitMsg(e) }] };
-      } catch {
-        return {
-          content: [{ type: "text", text: `搜索失败: ${String(e)}` }],
-          isError: true,
-        };
-      }
+      return toToolError("搜索失败", e);
     }
   }
 );
@@ -391,11 +577,13 @@ server.tool(
   {
     product_code: z
       .string()
+      .trim()
+      .regex(PRODUCT_CODE_PATTERN, 'LCSC C编号必须类似 "C123456" 或 "123456"')
       .describe('LCSC C编号，如 "C123456"'),
   },
   async ({ product_code }) => {
-    let code = product_code.trim().toUpperCase();
-    if (!code.startsWith("C")) code = "C" + code;
+    const code = normalizeProductCode(product_code);
+
     try {
       const detail = await getProductDetail(code);
       if (!detail)
@@ -404,14 +592,7 @@ server.tool(
         };
       return { content: [{ type: "text", text: formatDetail(detail) }] };
     } catch (e) {
-      try {
-        return { content: [{ type: "text", text: rateLimitMsg(e) }] };
-      } catch {
-        return {
-          content: [{ type: "text", text: `查询失败: ${String(e)}` }],
-          isError: true,
-        };
-      }
+      return toToolError("查询失败", e);
     }
   }
 );
@@ -422,11 +603,13 @@ server.tool(
   {
     product_code: z
       .string()
+      .trim()
+      .regex(PRODUCT_CODE_PATTERN, 'LCSC C编号必须类似 "C123456" 或 "123456"')
       .describe('LCSC C编号，如 "C123456"'),
   },
   async ({ product_code }) => {
-    let code = product_code.trim().toUpperCase();
-    if (!code.startsWith("C")) code = "C" + code;
+    const code = normalizeProductCode(product_code);
+
     try {
       const detail = await getProductDetail(code);
       const url = detail?.datasheet_url;
@@ -441,14 +624,7 @@ server.tool(
         ],
       };
     } catch (e) {
-      try {
-        return { content: [{ type: "text", text: rateLimitMsg(e) }] };
-      } catch {
-        return {
-          content: [{ type: "text", text: `查询失败: ${String(e)}` }],
-          isError: true,
-        };
-      }
+      return toToolError("查询失败", e);
     }
   }
 );
