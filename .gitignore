@@ -2,3 +2,4 @@ node_modules/
 nodejs/
 dist/
 *.tsbuildinfo
+docs
