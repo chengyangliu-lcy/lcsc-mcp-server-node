@@ -3,3 +3,5 @@ nodejs/
 dist/
 *.tsbuildinfo
 docs
+__pycache__/
+*.py[cod]
